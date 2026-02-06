@@ -1,0 +1,23 @@
+[project]
+name = "wabackend-brain"
+version = "0.1.0"
+description = "Decision API for conversation management with LLM providers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic-settings>=2.1.0",
+    "python-dateutil>=2.8.2",
+    "logfire[fastapi,pydantic]>=0.10.0",
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "langchain-google-genai>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.26.0",
+]

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     # App Auth Settings
     APP_API_KEY: Optional[str] = None
-    LOGFIRE_TOKEN: Optional[str] = None  # Also reads LOG_FIRE_TOKEN
+    LOG_FIRE_TOKEN: Optional[str] = None
 
     # OpenAI settings
     OPENAI_API_KEY: Optional[str] = None
@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: Optional[str] = None
     WHATSAPP_API_VERSION: str = "v21.0"
     WEBHOOK_VERIFY_TOKEN: Optional[str] = None
+
+    # Supabase settings
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_SERVICE_KEY: Optional[str] = None
+
+    # Cron settings
+    CRON_SECRET: str = "akasavani_cron_secret_2024"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

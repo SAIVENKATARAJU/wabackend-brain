@@ -1,62 +1,35 @@
-"""LangGraph Decision Agent with Pydantic structured output."""
+"""LangGraph Decision Agent."""
 import logging
 from datetime import datetime
-from typing import Annotated, Literal
-
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import Annotated, Literal, List, Dict, Any, Optional
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from app.config import settings
-from app.models import (
-    ActionEnum,
-    DecisionRequest,
-    DecisionResponse,
-    FALLBACK_RESPONSE,
-    StatusEnum,
-)
+from app.models import DecisionRequest, DecisionResponse, ActionEnum, StatusEnum, FALLBACK_RESPONSE
+from app.tools import schedule_nudge, update_crm, search_context
 
 logger = logging.getLogger(__name__)
 
-
-# Pydantic model for LLM structured output
-class DecisionOutput(BaseModel):
-    """Structured output from the LLM decision."""
-    action: Literal["wait", "reschedule", "close", "escalate"] = Field(
-        description="The action to take"
-    )
-    after_hours: int | None = Field(
-        description="Hours to wait before next action. Null if action is 'close'."
-    )
-    new_status: Literal["pending", "promised", "escalated", "closed"] = Field(
-        description="The new conversation status"
-    )
-    confidence: float = Field(
-        description="Confidence score between 0 and 1",
-        ge=0,
-        le=1
-    )
-
-
-# LangGraph state
+# --- State ---
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    decision: DecisionOutput | None
+    thread_id: Optional[str]
+    contact_info: Optional[Dict[str, Any]]
+    final_output: Optional[DecisionResponse]
 
-
-def get_llm(provider: str):
+# --- LLM Setup ---
+def get_llm():
     """Get LLM instance based on provider name."""
-    logger.info(f"Initializing LLM provider: {provider}")
-    
+    provider = settings.LLM_PROVIDER
     if provider == "openai":
-        return ChatOpenAI(
-            model=settings.OPENAI_MODEL,
-            api_key=settings.OPENAI_API_KEY,
-        )
+        return ChatOpenAI(model=settings.OPENAI_MODEL, api_key=settings.OPENAI_API_KEY)
     elif provider == "azure_openai":
         return AzureChatOpenAI(
             azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
@@ -65,112 +38,147 @@ def get_llm(provider: str):
             api_version=settings.AZURE_OPENAI_API_VERSION,
         )
     elif provider == "gemini":
-        return ChatGoogleGenerativeAI(
-            model=settings.GEMINI_MODEL,
-            google_api_key=settings.GEMINI_API_KEY,
-        )
+        return ChatGoogleGenerativeAI(model=settings.GEMINI_MODEL, google_api_key=settings.GEMINI_API_KEY)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
+# --- Nodes ---
 
-SYSTEM_PROMPT = """You are a decision engine for a conversation management system. 
-Based on the user's reply and current status, determine the next action.
+class DecisionOutputPydantic(BaseModel):
+    """Structured output for the decision."""
+    action: Literal["wait", "reschedule", "close", "escalate"]
+    after_hours: Optional[int] = Field(description="Hours to wait before next check. Required if action is reschedule or wait.")
+    new_status: Literal["pending", "promised", "escalated", "closed"]
+    reasoning: str = Field(description="Brief explanation of the decision.")
+    confidence: float
 
-Guidelines:
-- If user promises to pay/act at a specific time → action="reschedule", calculate after_hours from now, status="promised"
-- If user asks for help or shows frustration → action="escalate", status="escalated"
-- If user confirms completion/resolution → action="close", after_hours=null, status="closed"
-- If message is unclear or needs more info → action="wait", after_hours=24, status="pending"
-
-DATE CALCULATION:
-- You are given the current date and time
-- Calculate after_hours as the number of hours from NOW to the promised date/time
-- Examples:
-  - "tomorrow" = 24 hours
-  - "next week" = 168 hours (7 days)
-  - "10 days" = 240 hours
-  - "in 3 days" = 72 hours"""
-
-
-def create_decision_graph():
-    """Create the LangGraph decision graph."""
+async def reason_node(state: AgentState):
+    """Reason about the next step."""
+    llm = get_llm()
     
-    # Get LLM with structured output
-    llm = get_llm(settings.LLM_PROVIDER)
-    structured_llm = llm.with_structured_output(DecisionOutput)
-    
-    # Define the decision node
-    async def decide_node(state: AgentState) -> AgentState:
-        """Node that makes the decision using structured output."""
-        logger.info("Running decision node")
+    # Pre-check for clear rejection signals to avoid tool calling
+    # This prevents the LLM from scheduling a nudge before deciding to close
+    import re
+    last_msg = state["messages"][-1]
+    if isinstance(last_msg, HumanMessage):
+        text = last_msg.content.lower()
+        if "incoming message:" in text:
+            text = text.split("incoming message:", 1)[1].strip()
+            
+        rejection_patterns = [
+            r"not interested", r"i am not interested", r"i'm not interested",
+            r"stop", r"unsubscribe", r"remove me", r"don't contact", 
+            r"do not contact", r"not looking", r"fail", r"no thanks",
+            r"goodbye", r"out of the deal"
+        ]
         
-        # Call LLM with structured output
-        result = await structured_llm.ainvoke(state["messages"])
-        
-        logger.info(f"Decision result: {result}")
-        return {"decision": result}
+        if any(re.search(p, text) for p in rejection_patterns):
+            logger.info(f"[Agent] Detected rejection in message: '{text}'. Skipping tools.")
+            # Don't bind tools, just return a direct response that forces CLOSE
+            return {"messages": [AIMessage(content="User rejected. Action: CLOSE. Status: CLOSED.")]}
+
+    # Bind tools to the LLM (for non-rejection cases)
+    tools = [schedule_nudge, update_crm, search_context]
+    llm_with_tools = llm.bind_tools(tools)
     
-    # Build the graph
+    # We force the LLM to either call a tool OR provide the final decision structure
+    # But for simplicity in ReAct, we let it use tools freely, and then conclude.
+    # To conclude, we can ask for a structured output or use a specific tool "submit_decision".
+    # For this MVP, let's use a dual-pass approach:
+    # 1. ReAct loop for gathering info/actions
+    # 2. Final structured extraction for the API response.
+    
+    response = await llm_with_tools.ainvoke(state["messages"])
+    return {"messages": [response]}
+
+async def finalize_decision_node(state: AgentState):
+    """Extract final structural decision after reasoning loop completes."""
+    llm = get_llm()
+    structured_llm = llm.with_structured_output(DecisionOutputPydantic)
+    
+    # Add a prompt to force conclusion
+    messages = state["messages"] + [HumanMessage(content="Based on the above, provide the final structured decision.")]
+    
+    result = await structured_llm.ainvoke(messages)
+    
+    # Map to DecisionResponse
+    final_decision = DecisionResponse(
+        action=ActionEnum(result.action),
+        after_hours=result.after_hours,
+        new_status=StatusEnum(result.new_status),
+        confidence=result.confidence
+    )
+    return {"final_output": final_decision}
+
+# --- Graph ---
+def create_graph():
     graph = StateGraph(AgentState)
     
-    # Add nodes
-    graph.add_node("decide", decide_node)
+    # Nodes
+    graph.add_node("reason", reason_node)
+    graph.add_node("tools", ToolNode([schedule_nudge, update_crm, search_context]))
+    graph.add_node("finalize", finalize_decision_node)
     
-    # Add edges
-    graph.add_edge(START, "decide")
-    graph.add_edge("decide", END)
+    # Edges
+    graph.add_edge(START, "reason")
+    
+    # Conditional edge: If tool call, go to tools, else go to finalize
+    graph.add_conditional_edges(
+        "reason",
+        tools_condition,
+        {"tools": "tools", "__end__": "finalize"}
+    )
+    
+    graph.add_edge("tools", "reason") # Loop back to reason after tool use
+    graph.add_edge("finalize", END)
     
     return graph.compile()
 
+# --- Entry Points ---
 
 async def run_decision(request: DecisionRequest) -> DecisionResponse:
-    """
-    Run the LangGraph decision agent with Pydantic structured output.
-    
-    Returns fallback response on any error.
-    """
+    """Run the agent to make a decision on an incoming message."""
     try:
-        # Build messages with current datetime
-        now = datetime.now()
-        current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
-        current_date = now.strftime("%Y-%m-%d")
+        graph = create_graph()
         
-        user_message = f"""Current Date and Time: {current_datetime}
-Today is: {current_date}
-
-Organization: {request.org_id}
-Conversation: {request.conversation_id}
-Contact: {request.contact_id}
-Current Status: {request.last_status.value}
-
-User's reply: "{request.incoming_text}"
-
-Analyze this reply and determine the next action. Calculate after_hours from the current time."""
-
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_message),
-        ]
+        system_msg = SystemMessage(content=f"""You are Akasavani, an AI Follow-up Assistant.
+        Org: {request.org_id}, Contact: {request.contact_id}, Thread: {request.conversation_id}
+        Current Status: {request.last_status.value}
         
-        # Create and run the graph
-        logger.info(f"Running LangGraph decision with provider: {settings.LLM_PROVIDER}")
-        graph = create_decision_graph()
+        Analyze the incoming message and decide the next action.
+        You can use tools to search context or schedule actions.
         
-        result = await graph.ainvoke({"messages": messages, "decision": None})
+        CRITICAL RULES:
+        1. REJECTION DETECTION: If the user indicates they are NOT interested, declining, or opting out (e.g., "I'm out", "not interested", "stop", "no thanks", "goodbye", "unsubscribe", "out of the deal"), you MUST:
+           - Set action to "close"
+           - Set new_status to "closed"
+           - Do NOT call schedule_nudge - there's no point in following up with someone who said no
         
-        decision: DecisionOutput = result["decision"]
+        2. When using schedule_nudge (only for engaged conversations), you MUST provide:
+           - suggested_content: A warm, contextual follow-up message
+           - For quick testing, use check_after_minutes (e.g., 2 minutes) instead of hours
         
-        if decision is None:
-            logger.warning("No decision from graph")
-            return FALLBACK_RESPONSE
+        Finally, you must output a structured decision.
+        """)
         
-        return DecisionResponse(
-            action=ActionEnum(decision.action),
-            after_hours=decision.after_hours,
-            new_status=StatusEnum(decision.new_status),
-            confidence=decision.confidence
-        )
+        user_msg = HumanMessage(content=f"Incoming Message: {request.incoming_text}")
+        
+        result = await graph.ainvoke({
+            "messages": [system_msg, user_msg],
+            "thread_id": request.conversation_id,
+            "contact_info": {"id": request.contact_id} # Mock
+        })
+        
+        return result["final_output"]
         
     except Exception as e:
-        logger.error(f"LangGraph decision failed: {e}")
+        logger.error(f"Agent failed: {e}")
         return FALLBACK_RESPONSE
+
+async def regenerate_draft(nudge_id: str, tone: Optional[str] = None):
+    """Regenerate a draft for a nudge."""
+    llm = get_llm()
+    # logical implementation would fetch nudge context here
+    prompt = f"Draft a follow-up email for nudge {nudge_id}. Tone: {tone or 'neutral'}."
+    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    return response.content

@@ -69,18 +69,26 @@ class WhatsAppApiError:
     fbtrace_id: Optional[str]
 
 
-def _build_template_payload(phone_number: str, template_name: str) -> dict[str, Any]:
+def _build_template_payload(phone_number: str, template_name: str, parameters: Optional[list] = None) -> dict[str, Any]:
     """Build the payload for a template message."""
+    template_data: Dict[str, Any] = {
+        "name": template_name,
+        "language": {
+            "code": "en_US"
+        }
+    }
+    
+    if parameters:
+        template_data["components"] = [{
+            "type": "body",
+            "parameters": parameters
+        }]
+        
     return {
         "messaging_product": "whatsapp",
         "to": phone_number,
         "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {
-                "code": "en_US"
-            }
-        }
+        "template": template_data
     }
 
 
@@ -104,7 +112,10 @@ async def send_whatsapp_message(
     phone_number: str,
     msg_type: str,
     content: str,
-    client: Optional[httpx.AsyncClient] = None
+    client: Optional[httpx.AsyncClient] = None,
+    access_token: Optional[str] = None,
+    phone_number_id: Optional[str] = None,
+    template_parameters: Optional[list] = None
 ) -> SendResult:
     """
     Sends a WhatsApp message (template or text) to the specified recipient.
@@ -114,42 +125,44 @@ async def send_whatsapp_message(
         msg_type: "template" or "text"
         content: Template name (for templates) or message body (for text)
         client: Optional httpx.AsyncClient (will create one if not provided)
+        access_token: Optional access token (uses env var if not provided)
+        phone_number_id: Optional phone number ID (uses env var if not provided)
     
     Returns:
         SendResult with message_id, recipient_wa_id, and status
     
     Raises:
-        DeliveryError: If environment variables are missing, network fails, or API returns error
+        DeliveryError: If credentials are missing, network fails, or API returns error
     """
-    # Validate environment variables
-    access_token = settings.WHATSAPP_ACCESS_TOKEN
-    if not access_token or access_token.strip() == "":
+    # Use provided credentials or fall back to environment variables
+    token = access_token or settings.WHATSAPP_ACCESS_TOKEN
+    if not token or token.strip() == "":
         raise DeliveryError(
             DeliveryErrorType.MISSING_ENV_VAR,
-            "WHATSAPP_ACCESS_TOKEN"
+            "WHATSAPP_ACCESS_TOKEN (not provided and not set in environment)"
         )
     
-    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
-    if not phone_number_id:
+    phone_id = phone_number_id or settings.WHATSAPP_PHONE_NUMBER_ID
+    if not phone_id:
         raise DeliveryError(
             DeliveryErrorType.MISSING_ENV_VAR,
-            "WHATSAPP_PHONE_NUMBER_ID"
+            "WHATSAPP_PHONE_NUMBER_ID (not provided and not set in environment)"
         )
     
     api_version = settings.WHATSAPP_API_VERSION
     
     # Build URL
-    url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+    url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
     
     # Build payload based on message type
     if msg_type == "template":
-        payload = _build_template_payload(phone_number, content)
+        payload = _build_template_payload(phone_number, content, template_parameters)
     else:
         payload = _build_text_payload(phone_number, content)
     
     # Headers
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     
@@ -240,6 +253,74 @@ async def send_text_message(
         SendResult with message_id, recipient_wa_id, and status
     """
     return await send_whatsapp_message(phone_number, "text", text, client)
+
+
+async def send_smart_nudge(
+    client_supabase,
+    nudge: dict,
+    contact_phone: str,
+    access_token: str,
+    phone_number_id: str
+) -> SendResult:
+    """
+    High-level function to send a nudge selectively using text or template.
+    Checks the 24-hour window for the conversation.
+    """
+    from datetime import datetime, timezone
+    
+    content = nudge.get("approved_content") or nudge.get("draft_content") or "Hello!"
+    conversation_id = nudge.get("conversation_id")
+    
+    can_send_text = False
+    try:
+        if conversation_id:
+            # Check last incoming message time
+            last_msg = client_supabase.table("messages").select("created_at").eq(
+                "conversation_id", conversation_id
+            ).eq("direction", "incoming").order("created_at", desc=True).limit(1).execute()
+            
+            if last_msg.data:
+                last_msg_time = datetime.fromisoformat(last_msg.data[0]["created_at"].replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                hours_since = (now - last_msg_time).total_seconds() / 3600
+                can_send_text = hours_since < 24
+    except Exception as e:
+        print(f"Error checking message window: {e}")
+        can_send_text = False
+        
+    if can_send_text:
+        # Use simple text message
+        return await send_whatsapp_message(
+            phone_number=contact_phone,
+            msg_type="text",
+            content=content,
+            access_token=access_token,
+            phone_number_id=phone_number_id
+        )
+    else:
+        # Try personalized template first, fall back to hello_world if not approved yet
+        try:
+            template_params = [{"type": "text", "text": content}]
+            return await send_whatsapp_message(
+                phone_number=contact_phone,
+                msg_type="template",
+                content="ai_followup_nudge",
+                access_token=access_token,
+                phone_number_id=phone_number_id,
+                template_parameters=template_params
+            )
+        except DeliveryError as e:
+            # Template not found/approved - fall back to hello_world
+            if e.status_code == 404 or "132001" in str(e):
+                print(f"Template not found, falling back to hello_world: {e}")
+                return await send_whatsapp_message(
+                    phone_number=contact_phone,
+                    msg_type="template",
+                    content="hello_world",
+                    access_token=access_token,
+                    phone_number_id=phone_number_id
+                )
+            raise  # Re-raise other errors
 
 
 # ============================================================================

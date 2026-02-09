@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.router import router
 from app.webhook import router as webhook_router
+from app.routers.cron import router as cron_router
 
 # Configure standard logging
 logging.basicConfig(
@@ -36,6 +37,7 @@ logfire.instrument_pydantic()
 
 app.include_router(router)
 app.include_router(webhook_router)
+app.include_router(cron_router)  # pg_cron calls this
 
 
 @app.get("/health")

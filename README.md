@@ -193,7 +193,7 @@ CREATE INDEX idx_conversations_tags ON conversations USING GIN(tags);
 
 ```mermaid
 graph TD
-    Client[Client App] --> API[API Gateway (FastAPI)]
+    Client[Client App] --> API["API Gateway (FastAPI)"]
     
     subgraph API Gateway
         Auth[Auth Service]
@@ -561,7 +561,7 @@ CREATE POLICY nudges_user_policy ON nudges
 
 ```mermaid
 graph TD
-    LB[Load Balancer (Cloud Run)] --> API1[API Pod 1]
+    LB["Load Balancer (Cloud Run)"] --> API1[API Pod 1]
     LB --> API2[API Pod 2]
     LB --> APIN[API Pod N]
     
@@ -570,9 +570,9 @@ graph TD
     APIN --> Supabase
     
     subgraph Supabase Platform
-        PG[(PostgreSQL + Realtime)]
-        Auth[Auth + OAuth]
-        Edge[Edge Functions + Workers]
+        PG[("PostgreSQL + Realtime")]
+        Auth["Auth + OAuth"]
+        Edge["Edge Functions + Workers"]
     end
     
     API1 --> Ext

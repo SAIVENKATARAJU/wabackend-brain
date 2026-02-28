@@ -6,6 +6,7 @@ Stores messages in the messages table and calls the AI decision agent.
 """
 
 import os
+import re
 import json
 from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,22 @@ from app.config import settings
 from app.models import DecisionRequest, StatusEnum, ActionEnum
 from app.delivery_engine import send_text_message, DeliveryError
 from app.database import update_conversation, calculate_next_action_at
+
+
+def sanitize_phone_number(phone: str) -> str:
+    """
+    Sanitize phone number to prevent SQL injection.
+    Only allows digits and optional leading +.
+    """
+    if not phone:
+        return ""
+    # Remove all non-digit characters except leading +
+    sanitized = re.sub(r"[^\d+]", "", phone)
+    # Ensure + is only at the beginning
+    if "+" in sanitized:
+        sanitized = "+" + sanitized.replace("+", "")
+    # Limit length (E.164 max is 15 digits + country code)
+    return sanitized[:20]
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 legacy_router = APIRouter(tags=["webhooks_legacy"])
@@ -51,7 +68,7 @@ async def webhook_verify(request: Request):
     hub_verify_token = params.get("hub.verify_token")
     hub_challenge = params.get("hub.challenge")
     
-    verify_token = os.environ.get("WEBHOOK_VERIFY_TOKEN", "akasavani_webhook_token")
+    verify_token = settings.WEBHOOK_VERIFY_TOKEN or ""
     
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
         print("[Webhook] ✓ Verification successful!")
@@ -99,22 +116,84 @@ async def webhook_receive(request: Request) -> dict[str, str]:
 
 
 async def handle_status_update(status: dict[str, Any]) -> None:
-    """Update message status in database based on WhatsApp callback."""
+    """
+    Update message status in database based on WhatsApp callback.
+    
+    Meta sends these status values:
+    - sent: Message accepted by WhatsApp servers
+    - delivered: Message delivered to recipient's device
+    - read: Message read by recipient
+    - failed: Message delivery failed (includes error details)
+    """
     client = get_client()
     
     msg_id = status.get("id")
     status_text = status.get("status")  # sent, delivered, read, failed
+    timestamp = status.get("timestamp")  # Unix timestamp from Meta
     
     print(f"[Status] Message {msg_id}: {status_text}")
     
-    if msg_id and status_text:
-        # Update message status in database
-        try:
-            client.table("messages").update({
-                "status": status_text
-            }).eq("whatsapp_message_id", msg_id).execute()
-        except Exception as e:
-            print(f"[Status] Failed to update: {e}")
+    if not msg_id or not status_text:
+        return
+    
+    # Build update payload with status-specific timestamps
+    now = datetime.now(timezone.utc).isoformat()
+    update_data: dict[str, Any] = {"status": status_text}
+    
+    if status_text == "sent":
+        update_data["sent_at"] = now
+    elif status_text == "delivered":
+        update_data["delivered_at"] = now
+    elif status_text == "read":
+        update_data["read_at"] = now
+    elif status_text == "failed":
+        update_data["failed_at"] = now
+        # Extract error details from Meta's callback
+        errors = status.get("errors", [])
+        if errors:
+            error = errors[0]  # Meta typically sends one error
+            update_data["error_code"] = str(error.get("code", "unknown"))
+            update_data["error_message"] = error.get("title", "") or error.get("message", "Unknown error")
+            print(f"[Status] Error details: code={update_data['error_code']}, message={update_data['error_message']}")
+    
+    # Update message in database
+    try:
+        result = client.table("messages").update(
+            update_data
+        ).eq("whatsapp_message_id", msg_id).execute()
+        
+        updated_msg = result.data[0] if result.data else None
+        
+        if updated_msg:
+            print(f"[Status] Updated message {msg_id} -> {status_text}")
+            
+            # Sync nudge status if this message is linked to a conversation
+            conversation_id = updated_msg.get("conversation_id")
+            if conversation_id and status_text == "failed":
+                # If delivery failed, update the associated nudge to 'failed' too
+                try:
+                    client.table("nudges").update({
+                        "status": "failed"
+                    }).eq("conversation_id", conversation_id).eq("status", "sent").execute()
+                    print(f"[Status] Synced nudge status to failed for conversation {conversation_id[:8]}...")
+                except Exception as e:
+                    print(f"[Status] Failed to sync nudge status: {e}")
+            
+            elif conversation_id and status_text == "delivered":
+                # Update conversation status to reflect delivery
+                try:
+                    client.table("conversations").update({
+                        "status": "awaiting"
+                    }).eq("id", conversation_id).in_("status", ["pending", "approved"]).execute()
+                except Exception as e:
+                    print(f"[Status] Failed to update conversation: {e}")
+        else:
+            print(f"[Status] No message found with whatsapp_message_id: {msg_id}")
+            
+    except Exception as e:
+        print(f"[Status] Failed to update: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def handle_incoming_message(message: dict[str, Any], phone_number_id: str) -> None:
@@ -232,19 +311,25 @@ async def get_or_create_contact(user_id: str, phone_number: str) -> Optional[dic
     """Get or create a contact by user_id and phone_number."""
     client = get_client()
     
+    # Sanitize phone number to prevent SQL injection
+    safe_phone = sanitize_phone_number(phone_number)
+    if not safe_phone:
+        print(f"[Contact] Invalid phone number: {phone_number}")
+        return None
+    
     # Normalize phone number (WhatsApp sends without +, we usually store with +)
-    search_number = phone_number
+    search_number = safe_phone
     if not search_number.startswith("+"):
-        search_number = "+" + search_number
+        search_number = "+" + safe_phone
     
     try:
         # Try to find existing contact with normalized or raw number
-        # We check both to be safe
+        # Use .in_() instead of .or_() with string interpolation for safety
         result = (
             client.table("contacts")
             .select("*")
             .eq("user_id", user_id)
-            .or_(f"phone_number.eq.{search_number},phone_number.eq.{phone_number}")
+            .in_("phone_number", [search_number, safe_phone])
             .execute()
         )
         
@@ -257,8 +342,8 @@ async def get_or_create_contact(user_id: str, phone_number: str) -> Optional[dic
         result = client.table("contacts").insert({
             "user_id": user_id,
             "phone_number": search_number,
-            "name": phone_number,
-            "email": None # Use NULL instead of empty string
+            "name": safe_phone,  # Use sanitized phone as name
+            "email": None  # Use NULL instead of empty string
         }).execute()
         
         return result.data[0] if result.data else None
@@ -303,10 +388,6 @@ async def get_or_create_conversation(user_id: str, contact_id: str) -> Optional[
     except Exception as e:
         print(f"[Conversation] Error: {e}")
         return None
-
-
-    except Exception as e:
-        print(f"[AI] Error: {e}")
 
 
 def build_reply_message(decision) -> str:

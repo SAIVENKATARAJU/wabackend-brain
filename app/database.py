@@ -44,7 +44,8 @@ async def get_or_create_contact(
         client.table("contacts")
         .select("*")
         .eq("user_id", str(org_id))
-        .eq("phone_number", phone_number)
+        .eq("user_id", str(org_id))
+        .in_("phone_number", [phone_number, f"+{phone_number.lstrip('+')}", phone_number.lstrip('+')])
         .execute()
     )
     
@@ -55,7 +56,7 @@ async def get_or_create_contact(
     result = client.table("contacts").insert({
         "user_id": str(org_id),
         "phone_number": phone_number,
-        "display_name": display_name
+        "name": display_name
     }).execute()
     return result.data[0]
 

@@ -251,7 +251,7 @@ async def send_nudge(id: str, user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="WhatsApp integration missing access token or phone number ID. Please reconfigure in Settings.")
 
     # 3. Send via Delivery Engine
-    from app.delivery_engine import send_smart_nudge
+    from app.delivery_engine import send_smart_nudge, DeliveryError
     
     try:
         # Use smart nudge logic (Hybrid flow: text vs template)
@@ -263,7 +263,7 @@ async def send_nudge(id: str, user: Dict[str, Any] = Depends(get_current_user)):
             phone_number_id=phone_number_id
         )
         
-        # 4. Store outgoing message in messages table
+        # 4. Store outgoing message in messages table with delivery tracking
         try:
             client.table("messages").insert({
                 "user_id": user.id,
@@ -273,7 +273,8 @@ async def send_nudge(id: str, user: Dict[str, Any] = Depends(get_current_user)):
                 "channel": "whatsapp",
                 "content": content,
                 "whatsapp_message_id": result.message_id if result else None,
-                "status": "sent"
+                "status": "sent",
+                "sent_at": datetime.utcnow().isoformat()
             }).execute()
         except Exception as msg_err:
             print(f"Failed to store message: {msg_err}")
@@ -294,9 +295,59 @@ async def send_nudge(id: str, user: Dict[str, Any] = Depends(get_current_user)):
 
         return update_result.data
         
-    except Exception as e:
+    except DeliveryError as e:
         print(f"Delivery Failed: {e}")
-        # Log failure - only update status since nudges table has no metadata column
+        
+        # Store the failed message so it appears in UI with error details
+        try:
+            client.table("messages").insert({
+                "user_id": user.id,
+                "conversation_id": nudge.get("conversation_id"),
+                "contact_id": nudge.get("contact_id"),
+                "direction": "outgoing",
+                "channel": "whatsapp",
+                "content": content,
+                "status": "failed",
+                "failed_at": datetime.utcnow().isoformat(),
+                "error_code": str(e.status_code) if e.status_code else "unknown",
+                "error_message": str(e.message)
+            }).execute()
+        except Exception as msg_err:
+            print(f"Failed to store failed message: {msg_err}")
+        
+        # Update nudge status to failed
+        client.table("nudges").update({
+            "status": "failed"
+        }).eq("id", id).execute()
+        
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "message": f"Failed to send message: {str(e)}",
+                "error_code": str(e.status_code) if e.status_code else None,
+                "error_type": e.error_type.value if e.error_type else None,
+                "can_retry": True
+            }
+        )
+    except Exception as e:
+        print(f"Delivery Failed (unexpected): {e}")
+        
+        # Store the failed message even for unexpected errors
+        try:
+            client.table("messages").insert({
+                "user_id": user.id,
+                "conversation_id": nudge.get("conversation_id"),
+                "contact_id": nudge.get("contact_id"),
+                "direction": "outgoing",
+                "channel": "whatsapp",
+                "content": content,
+                "status": "failed",
+                "failed_at": datetime.utcnow().isoformat(),
+                "error_message": str(e)
+            }).execute()
+        except Exception as msg_err:
+            print(f"Failed to store failed message: {msg_err}")
+        
         client.table("nudges").update({
             "status": "failed"
         }).eq("id", id).execute()

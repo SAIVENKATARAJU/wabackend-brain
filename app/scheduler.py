@@ -134,18 +134,18 @@ async def auto_send_nudge(nudge: dict):
             logger.error(f"[Scheduler] Missing WhatsApp credentials for user {user_id}")
             return
         
-        # Send via delivery engine
-        from app.delivery_engine import send_whatsapp_message
+        # Send via delivery engine using smart nudge logic
+        from app.delivery_engine import send_smart_nudge
         
-        content = nudge.get("approved_content") or nudge.get("draft_content") or "Hello!"
-        
-        result = await send_whatsapp_message(
-            phone_number=contact_phone,
-            msg_type="template",
-            content="hello_world",  # Using template for reliable delivery
+        result = await send_smart_nudge(
+            client_supabase=client,
+            nudge=nudge,
+            contact_phone=contact_phone,
             access_token=access_token,
             phone_number_id=phone_number_id
         )
+        
+        content = nudge.get("approved_content") or nudge.get("draft_content") or "Hello!"
         
         # Update nudge status
         client.table("nudges").update({

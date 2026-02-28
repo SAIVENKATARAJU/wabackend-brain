@@ -1,10 +1,27 @@
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import List, Optional, Dict, Any
 from app.supabase_client import get_client
 from app.routers.auth import get_current_user
 from app.models import StatusEnum
-from app.models import StatusEnum
 from datetime import datetime, timedelta, timezone
+
+
+def sanitize_search_input(search: str) -> str:
+    """
+    Sanitize search input to prevent SQL injection.
+    Escapes special characters used in LIKE/ILIKE patterns.
+    """
+    if not search:
+        return ""
+    # Escape SQL LIKE wildcards and special characters
+    sanitized = search.replace("\\", "\\\\")  # Escape backslashes first
+    sanitized = sanitized.replace("%", "\\%")  # Escape percent
+    sanitized = sanitized.replace("_", "\\_")  # Escape underscore
+    # Remove any potential SQL injection characters
+    sanitized = re.sub(r"[';\"\\-]", "", sanitized)
+    # Limit length to prevent abuse
+    return sanitized[:100]
 
 router = APIRouter(
     prefix="/conversations",
@@ -32,9 +49,11 @@ async def list_conversations(
         query = query.eq("status", status)
     
     if search:
-        # Simple search on subject or contact info (needs optimized search later)
-        # Using Supabase 'ilike' or similar
-        query = query.or_(f"subject.ilike.%{search}%")
+        # Sanitize search input to prevent SQL injection
+        safe_search = sanitize_search_input(search)
+        if safe_search:
+            # Use ilike for case-insensitive search with sanitized input
+            query = query.ilike("subject", f"%{safe_search}%")
         
     if tags:
         query = query.contains("tags", tags)

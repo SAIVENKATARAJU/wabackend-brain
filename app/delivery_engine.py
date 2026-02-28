@@ -69,12 +69,21 @@ class WhatsAppApiError:
     fbtrace_id: Optional[str]
 
 
-def _build_template_payload(phone_number: str, template_name: str, parameters: Optional[list] = None) -> dict[str, Any]:
+# TODO: Move these to per-user config in `integrations.metadata` and fetch from DB
+# These should be configurable from Settings > WhatsApp Business in the UI
+DEFAULT_TEMPLATE_NAME = "ai_followup"           # Approved Meta template name
+DEFAULT_TEMPLATE_PARAM_NAME = "followup_message"  # Named variable in the template
+DEFAULT_TEMPLATE_LANGUAGE = "en"                  # Template language code
+FALLBACK_TEMPLATE_NAME = "hello_world"            # Fallback if primary template fails
+
+
+def _build_template_payload(phone_number: str, template_name: str, parameters: Optional[list] = None, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict[str, Any]:
     """Build the payload for a template message."""
-    template_data: Dict[str, Any] = {
+    # TODO: Accept language from user's integration config instead of default
+    template_data: dict[str, Any] = {
         "name": template_name,
         "language": {
-            "code": "en_US"
+            "code": language
         }
     }
     
@@ -165,6 +174,11 @@ async def send_whatsapp_message(
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+    
+    # Debug logging
+    print(f"[DEBUG] Sending WhatsApp message:")
+    print(f"[DEBUG] Template: {content if msg_type == 'template' else 'N/A'}")
+    print(f"[DEBUG] Payload: {payload}")
     
     # Send request
     should_close_client = client is None
@@ -265,11 +279,29 @@ async def send_smart_nudge(
     """
     High-level function to send a nudge selectively using text or template.
     Checks the 24-hour window for the conversation.
+    
+    Template Config (hardcoded for now):
+        - Template: DEFAULT_TEMPLATE_NAME ("ai_followup")
+        - Parameter: DEFAULT_TEMPLATE_PARAM_NAME ("followup_message")
+        - Language: DEFAULT_TEMPLATE_LANGUAGE ("en")
+        - Fallback: FALLBACK_TEMPLATE_NAME ("hello_world")
+    
+    TODO: Fetch template config from user's integration settings:
+        integration = client_supabase.table("integrations").select("metadata")
+            .eq("user_id", nudge["user_id"]).eq("provider", "whatsapp").single().execute()
+        template_name = integration.data["metadata"].get("template_name", DEFAULT_TEMPLATE_NAME)
+        param_name = integration.data["metadata"].get("template_param_name", DEFAULT_TEMPLATE_PARAM_NAME)
     """
     from datetime import datetime, timezone
     
     content = nudge.get("approved_content") or nudge.get("draft_content") or "Hello!"
     conversation_id = nudge.get("conversation_id")
+    
+    # TODO: Fetch these from user's integration metadata instead of using hardcoded defaults
+    template_name = DEFAULT_TEMPLATE_NAME
+    param_name = DEFAULT_TEMPLATE_PARAM_NAME
+    template_language = DEFAULT_TEMPLATE_LANGUAGE
+    fallback_template = FALLBACK_TEMPLATE_NAME
     
     can_send_text = False
     try:
@@ -289,7 +321,7 @@ async def send_smart_nudge(
         can_send_text = False
         
     if can_send_text:
-        # Use simple text message
+        # Within 24-hour window: use simple text message (no template needed)
         return await send_whatsapp_message(
             phone_number=contact_phone,
             msg_type="text",
@@ -298,25 +330,38 @@ async def send_smart_nudge(
             phone_number_id=phone_number_id
         )
     else:
-        # Try personalized template first, fall back to hello_world if not approved yet
+        # Outside 24-hour window: must use approved template
         try:
-            template_params = [{"type": "text", "text": content}]
+            # Validate content is not empty
+            if not content or content.strip() == "":
+                print(f"[WARNING] Content is empty, using default message")
+                content = "Hi! This is a follow-up message. Let me know if you have any questions."
+            
+            # TODO: Build params dynamically based on user's template config
+            template_params = [{
+                "type": "text",
+                "parameter_name": param_name,  # Must match the named variable in the Meta template
+                "text": content
+            }]
+            
+            print(f"[DEBUG] Sending template '{template_name}' with param '{param_name}'")
+            
             return await send_whatsapp_message(
                 phone_number=contact_phone,
                 msg_type="template",
-                content="ai_followup_nudge",
+                content=template_name,
                 access_token=access_token,
                 phone_number_id=phone_number_id,
                 template_parameters=template_params
             )
         except DeliveryError as e:
-            # Template not found/approved - fall back to hello_world
+            # Template not found/approved - fall back to hello_world (no params)
             if e.status_code == 404 or "132001" in str(e):
-                print(f"Template not found, falling back to hello_world: {e}")
+                print(f"Template '{template_name}' not found, falling back to '{fallback_template}': {e}")
                 return await send_whatsapp_message(
                     phone_number=contact_phone,
                     msg_type="template",
-                    content="hello_world",
+                    content=fallback_template,
                     access_token=access_token,
                     phone_number_id=phone_number_id
                 )

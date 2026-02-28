@@ -1,4 +1,5 @@
 """Main entry point for the wabackend-brain API."""
+import os
 import logging
 # Configure Logfire
 import logfire
@@ -9,12 +10,13 @@ if settings.LOG_FIRE_TOKEN:
 else:
     logfire.configure(send_to_logfire=False)
 
-from fastapi import APIRouter, FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 # Import new routers
-from app.routers import auth, dashboard, conversations, contacts, nudges, webhooks, settings, cron
+from app.routers import auth, dashboard, conversations, contacts, nudges, webhooks, cron, messages
+from app.routers import settings as settings_router
 # Import existing router if needed, or deprecate it
 from app.router import router as decision_router # Keeping for backward compat or agent specific logic
 
@@ -35,12 +37,7 @@ logfire.instrument_fastapi(app)
 logfire.instrument_pydantic()
 
 # Configure CORS
-origins = [
-    "http://localhost:3000",
-    "http://localhost:8000",
-    "https://akasavani.vercel.app", # Add production URL
-    "*" # Allow all for dev
-]
+origins = [origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,8 +52,9 @@ app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(conversations.router)
 app.include_router(contacts.router)
-app.include_router(settings.router)
+app.include_router(settings_router.router)
 app.include_router(nudges.router)
+app.include_router(messages.router)
 app.include_router(webhooks.router)
 app.include_router(webhooks.legacy_router) # Support /webhook (singular)
 app.include_router(cron.router)  # pg_cron calls this

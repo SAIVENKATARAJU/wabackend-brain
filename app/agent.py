@@ -29,16 +29,16 @@ def get_llm():
     """Get LLM instance based on provider name."""
     provider = settings.LLM_PROVIDER
     if provider == "openai":
-        return ChatOpenAI(model=settings.OPENAI_MODEL, api_key=settings.OPENAI_API_KEY)
+        return ChatOpenAI(model=settings.OPENAI_MODEL, api_key=settings.OPENAI_KEY)
     elif provider == "azure_openai":
         return AzureChatOpenAI(
-            azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
+            azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
             azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_API_KEY,
+            api_key=settings.AZURE_OPENAI_KEY,
             api_version=settings.AZURE_OPENAI_API_VERSION,
         )
     elif provider == "gemini":
-        return ChatGoogleGenerativeAI(model=settings.GEMINI_MODEL, google_api_key=settings.GEMINI_API_KEY)
+        return ChatGoogleGenerativeAI(model=settings.GEMINI_MODEL_NAME, google_api_key=settings.GEMINI_API_KEY)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

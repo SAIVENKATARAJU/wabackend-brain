@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL_NAME: str = "gemini-3-flash-preview"
     
+    # Google OAuth settings (backend-first auth)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_REDIRECT_URI: Optional[str] = None
+    FRONTEND_URL: str = "http://localhost:3000"
+
     # WhatsApp Cloud API settings
     WHATSAPP_ACCESS_TOKEN: Optional[str] = None
     WHATSAPP_PHONE_NUMBER_ID: Optional[str] = None
